@@ -134,6 +134,7 @@ def _sliding_windows(
     pred_horizon: int = 1,
     has_labels: bool = True,
     label_idx: int = -1,
+    base_rul: float = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Convert a single engine's time series into sliding-window samples.
@@ -145,12 +146,15 @@ def _sliding_windows(
         pred_horizon: RUL prediction horizon (label taken from this many steps ahead).
         has_labels: whether engine_data includes label column.
         label_idx: column index of the label (default -1 = last).
+        base_rul: if provided (test mode), the RUL at the *last* cycle of the
+            original sequence. Per-window labels are computed as base_rul plus
+            the number of cycles remaining from the label position to end of seq.
 
     Returns:
         X: (num_windows, window_size, num_features)
         y: (num_windows,)
     """
-    seq_len = engine_data.shape[0]
+    orig_seq_len = engine_data.shape[0]
     if has_labels:
         features = engine_data[:, :label_idx]
         labels = engine_data[:, label_idx]
@@ -161,15 +165,16 @@ def _sliding_windows(
     num_features = features.shape[1]
     min_len = window_size + pred_horizon
 
-    if seq_len < min_len:
-        pad_len = min_len - seq_len
+    pad_len = 0
+    if orig_seq_len < min_len:
+        pad_len = min_len - orig_seq_len
         pad_features = np.repeat(features[:1], pad_len, axis=0)
         features = np.concatenate([pad_features, features], axis=0)
         if has_labels:
             pad_labels = np.full(pad_len, labels[0], dtype=labels.dtype)
             labels = np.concatenate([pad_labels, labels], axis=0)
-        seq_len = min_len
 
+    seq_len = features.shape[0]  # may include padding
     window_starts = list(range(0, seq_len - window_size - pred_horizon + 1, stride))
 
     X = np.zeros((len(window_starts), window_size, num_features), dtype=np.float32)
@@ -180,6 +185,10 @@ def _sliding_windows(
         X[i] = features[start:end]
         if has_labels:
             y[i] = labels[end + pred_horizon - 1]
+        elif base_rul is not None:
+            label_pos = end + pred_horizon - 1
+            orig_pos = label_pos - pad_len
+            y[i] = base_rul + (orig_seq_len - 1 - orig_pos)
         else:
             y[i] = 0.0  # placeholder
 
@@ -294,9 +303,10 @@ def build_cmapss_client_data(
             num_features = X.shape[-1]
 
     for uid, eng_data in test_engines.items():
-        X, y = _sliding_windows(eng_data, window_size, stride, pred_horizon, has_labels=False)
         engine_idx = list(test_engines.keys()).index(uid)
-        y[:] = test_rul[engine_idx] / _target_scale
+        X, y = _sliding_windows(eng_data, window_size, stride, pred_horizon,
+                                has_labels=False, base_rul=float(test_rul[engine_idx]))
+        y = y / _target_scale
         test_windows[uid] = (X, y)
 
     # --- 3. Normalize: fit on training data only ---
