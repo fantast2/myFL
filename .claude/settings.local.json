@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import torch; print\\(torch.__version__\\)\")",
+      "Bash(pip list *)",
+      "Bash(conda env *)",
+      "Bash(pip install *)",
+      "Bash(python -m pytest tests/test_cmapss.py -v --tb=short)",
+      "Bash(git init *)",
+      "Bash(git add *)"
+    ]
+  }
+}
