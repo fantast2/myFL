@@ -11,7 +11,9 @@
       "Bash(python -m pytest tests/test_cmapss.py -v)",
       "Bash(python -c ' *)",
       "Bash(python -c \"import ast; ast.parse\\(open\\('utils/cmapss_data.py'\\).read\\(\\)\\); print\\('Syntax OK'\\)\")",
-      "Bash(python -c \"import ast; ast.parse\\(open\\('utils/cmapss_data.py', encoding='utf-8'\\).read\\(\\)\\); print\\('Syntax OK'\\)\")"
+      "Bash(python -c \"import ast; ast.parse\\(open\\('utils/cmapss_data.py', encoding='utf-8'\\).read\\(\\)\\); print\\('Syntax OK'\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('utils/cmapss_data.py', encoding='utf-8'\\).read\\(\\)\\); print\\('cmapss_data.py: Syntax OK'\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('fl.py', encoding='utf-8'\\).read\\(\\)\\); print\\('fl.py: Syntax OK'\\)\")"
     ]
   }
 }

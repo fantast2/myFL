@@ -105,6 +105,10 @@ class SimulationFL(ABC):
                 rul_cap=self.rul_cap,
                 cmapss_data_dir=self.cmapss_data_dir,
             )
+            # Store engine counts per client for FedAvg weighting (not window counts)
+            from utils.cmapss_data import build_cmapss_client_data
+            self._client_num_engines = getattr(
+                build_cmapss_client_data, "_client_num_engines", {})
         else:
             self.client_data_loader = get_client_data_loader(
                 self.dataset,
@@ -606,6 +610,24 @@ class SimulationFL(ABC):
     #
     #     else:
     #         raise ValueError("Invalid fusion method")
+    def _get_fedavg_data_sizes(self, round_idx: int) -> Dict[int, int]:
+        """Return per-client data sizes for aggregation weighting.
+
+        For CMAPSS: weight by number of training ENGINES (unique information),
+        not number of windows (highly correlated within an engine).
+        For classification: weight by number of training samples.
+        """
+        if self.is_regression and hasattr(self, '_client_num_engines') and self._client_num_engines:
+            return {
+                p_id: max(self._client_num_engines.get(p_id, 1), 1)
+                for p_id in self.round_client_list[round_idx]
+            }
+        else:
+            return {
+                p_id: sum(len(batch[0]) for batch in self.client_data_loader[p_id][0])
+                for p_id in self.round_client_list[round_idx]
+            }
+
     def aggregate_model(self, round_idx: int, model_updates: dict) -> Dict[str, Any]:
         logger.info("start model aggregation...fusion method: {}".format(self.fusion))
 
@@ -613,10 +635,7 @@ class SimulationFL(ABC):
             return fusion_avg(model_updates)
 
         elif self.fusion == "fedavg":
-            data_sizes = {
-                p_id: sum(len(batch[0]) for batch in self.client_data_loader[p_id][0])
-                for p_id in self.round_client_list[round_idx]
-            }
+            data_sizes = self._get_fedavg_data_sizes(round_idx)
             return fusion_fedavg(model_updates, data_sizes)
 
         elif self.fusion == "krum":
@@ -637,10 +656,7 @@ class SimulationFL(ABC):
 
         elif self.fusion == "dual_defense":
             logger.info("start secure robust fusion with epsilon {}".format(self.epsilon))
-            data_sizes = {
-                p_id: sum(len(batch[0]) for batch in self.client_data_loader[p_id][0])
-                for p_id in self.round_client_list[round_idx]
-            }
+            data_sizes = self._get_fedavg_data_sizes(round_idx)
             return fusion_dual_defense(
                 self.server_model,
                 model_updates,

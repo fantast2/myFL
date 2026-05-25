@@ -290,9 +290,8 @@ def build_cmapss_client_data(
     if _target_scale < 1.0:
         _target_scale = 1.0
 
-    # --- 2. Build sliding windows per engine ---
+    # --- 2. Build sliding windows per engine (training only) ---
     train_windows = {}   # uid -> (X, y)
-    test_windows = {}    # uid -> (X, y)
     num_features = None
 
     for uid, eng_data in train_engines.items():
@@ -302,18 +301,7 @@ def build_cmapss_client_data(
         if num_features is None:
             num_features = X.shape[-1]
 
-    for uid, eng_data in test_engines.items():
-        engine_idx = list(test_engines.keys()).index(uid)
-        X, y = _sliding_windows(eng_data, window_size, stride, pred_horizon,
-                                has_labels=False, base_rul=float(test_rul[engine_idx]))
-        # Cap labels at rul_cap: model trained with capped targets cannot predict
-        # above the cap, so evaluating on uncapped labels is invalid.
-        if rul_cap and rul_cap > 0:
-            y = np.minimum(y, float(rul_cap))
-        y = y / _target_scale
-        test_windows[uid] = (X, y)
-
-    # --- 3. Normalize: fit on training data only ---
+    # --- 3. Normalize: fit on training data only, then apply to train ---
     all_train_X = np.concatenate([v[0] for v in train_windows.values()], axis=0)
     normalizer = CmapssNormalizer(method=normalization_method)
     normalizer.fit(all_train_X)
@@ -321,13 +309,36 @@ def build_cmapss_client_data(
     for uid in train_windows:
         X, y = train_windows[uid]
         train_windows[uid] = (normalizer.transform(X), y)
-    for uid in test_windows:
-        X, y = test_windows[uid]
-        test_windows[uid] = (normalizer.transform(X), y)
 
-    # --- 4. Partition engines across clients ---
+    # --- 4. Build engine-level test samples (last window per engine) ---
+    # Both client and global evaluation use the same format: one sample per engine.
+    # This avoids window-level vs engine-level metric mismatch.
+    test_engine_ids = sorted(test_engines.keys())
+    engine_test_X_list = []
+    engine_test_y_list = []
+    for uid in test_engine_ids:
+        eng_data = test_engines[uid]
+        engine_idx = test_engine_ids.index(uid)
+        # Take only the last window_size cycles
+        if len(eng_data) >= window_size:
+            last_win = eng_data[-window_size:]
+        else:
+            pad = window_size - len(eng_data)
+            last_win = np.concatenate(
+                [np.repeat(eng_data[:1], pad, axis=0), eng_data], axis=0)
+        engine_test_X_list.append(last_win)
+        # True RUL at last recorded cycle, capped consistently with training
+        true_rul = float(test_rul[engine_idx])
+        if rul_cap and rul_cap > 0:
+            true_rul = min(true_rul, float(rul_cap))
+        engine_test_y_list.append(true_rul / _target_scale)
+
+    engine_test_X = normalizer.transform(np.stack(engine_test_X_list, axis=0))
+    engine_test_y = np.array(engine_test_y_list, dtype=np.float32)
+    engine_test_ds = CmapssDataset(engine_test_X, engine_test_y)
+
+    # --- 5. Partition engines across clients ---
     train_engine_ids = sorted(train_windows.keys())
-    test_engine_ids = sorted(test_windows.keys())
     n_train_engines = len(train_engine_ids)
 
     if partition_type == "iid":
@@ -390,17 +401,20 @@ def build_cmapss_client_data(
     else:
         raise ValueError(f"Unknown partition type: {partition_type}")
 
-    # --- 5. Build per-client DataLoaders ---
-    # Test data: each client gets a subset of test engines (for local eval)
+    # --- 6. Build per-client DataLoaders ---
+    # Per-client train: window-level (for training).
+    # Per-client test: engine-level (one sample per engine, same granularity as global).
+    #
+    # Build a uid→index mapping (engine_test arrays are in sorted uid order).
+    _sorted_test_uids = sorted(test_engines.keys())
+    _uid_to_idx = {uid: i for i, uid in enumerate(_sorted_test_uids)}
+
+    # Shuffle test engine assignment across clients for fairness.
     np.random.shuffle(test_engine_ids)
-    test_per_client = n_train_engines // num_clients if n_train_engines > 0 else 1
-    # actually use all test engines per client for better evaluation
-    # but for FL realism, assign a small per-client test set from train engines (val split)
-    # We'll use a hold-out portion of train engines as per-client validation
 
     client_data_loader = {}
     for cid in range(num_clients):
-        # --- client train set ---
+        # --- client train set (window-level, as before) ---
         train_X = []
         train_y = []
         for uid in client_engines[cid]:
@@ -418,72 +432,40 @@ def build_cmapss_client_data(
         train_ds = CmapssDataset(train_X, train_y)
         train_dl = data.DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=False)
 
-        # --- client test/val set: use test engines as local eval ---
-        # Assign a fair share of test engines per client
+        # --- client test set (engine-level: one prediction per assigned engine) ---
         test_share = len(test_engine_ids) // num_clients
         test_start = cid * test_share
         test_end = (cid + 1) * test_share if cid < num_clients - 1 else len(test_engine_ids)
-        c_test_engines = test_engine_ids[test_start:test_end]
+        c_test_uids = test_engine_ids[test_start:test_end]
+        c_test_indices = [_uid_to_idx[uid] for uid in c_test_uids]
 
-        test_X = []
-        test_y = []
-        for uid in c_test_engines:
-            X, y = test_windows[uid]
-            test_X.append(X)
-            test_y.append(y)
-
-        if test_X:
-            test_X = np.concatenate(test_X, axis=0)
-            test_y = np.concatenate(test_y, axis=0)
-        else:
-            test_X = np.zeros((0, window_size, num_features), dtype=np.float32)
-            test_y = np.zeros((0,), dtype=np.float32)
-
-        test_ds = CmapssDataset(test_X, test_y)
+        c_test_X = engine_test_X[c_test_indices]
+        c_test_y = engine_test_y[c_test_indices]
+        test_ds = CmapssDataset(c_test_X, c_test_y)
         test_dl = data.DataLoader(test_ds, batch_size=batch_size, shuffle=False, drop_last=False)
 
         client_data_loader[cid] = (train_dl, test_dl)
         logger.info(
-            f"Client {cid}: {len(train_ds)} train samples, {len(test_ds)} test samples, "
-            f"{len(client_engines[cid])} engines"
+            f"Client {cid}: {len(train_ds)} train windows from {len(client_engines[cid])} engines, "
+            f"{len(test_ds)} test engines"
         )
 
-    # --- 6. Global test loader (CMAPSS standard: ONE prediction per engine) ---
-    # Standard CMAPSS evaluation: predict RUL from the LAST recorded cycle of
-    # each test engine, then compute RMSE across engines. This matches the
-    # benchmark protocol (one prediction per trajectory, not per sliding window).
-    global_test_X_list = []
-    global_test_y_list = []
-    for uid in test_engine_ids:
-        eng_data = test_engines[uid]
-        engine_idx = test_engine_ids.index(uid)
-        # Take only the last window_size cycles as input features
-        if len(eng_data) >= window_size:
-            last_win = eng_data[-window_size:]
-        else:
-            pad = window_size - len(eng_data)
-            last_win = np.concatenate(
-                [np.repeat(eng_data[:1], pad, axis=0), eng_data], axis=0)
-        global_test_X_list.append(last_win)
-        # Target: true RUL at the last recorded cycle, capped consistently with training
-        true_rul = float(test_rul[engine_idx])
-        if rul_cap and rul_cap > 0:
-            true_rul = min(true_rul, float(rul_cap))
-        global_test_y_list.append(true_rul / _target_scale)
-
-    global_test_X = normalizer.transform(np.stack(global_test_X_list, axis=0))
-    global_test_y = np.array(global_test_y_list, dtype=np.float32)
-    global_test_ds = CmapssDataset(global_test_X, global_test_y)
+    # --- 7. Global test loader: same engine-level data (all test engines) ---
+    # Global and per-client evaluation now use the SAME granularity:
+    # one prediction per engine at the last recorded cycle.
     global_test_dl = data.DataLoader(
-        global_test_ds, batch_size=batch_size, shuffle=False, drop_last=False)
+        engine_test_ds, batch_size=batch_size, shuffle=False, drop_last=False)
 
     logger.info(
-        f"Global test (CMAPSS standard): {len(global_test_ds)} engines, "
+        f"Global test (CMAPSS standard): {len(engine_test_ds)} engines, "
         f"one prediction per engine")
     logger.info(f"Target scale factor (rul_cap): {_target_scale:.1f}")
 
-    # Store scale factor so callers can unscale predictions/metrics
+    # Store module-level attributes for downstream use
     build_cmapss_client_data._target_scale = _target_scale
+    build_cmapss_client_data._client_num_engines = {
+        cid: len(client_engines[cid]) for cid in range(num_clients)
+    }
 
     return client_data_loader, global_test_dl
 
