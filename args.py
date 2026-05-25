@@ -134,7 +134,7 @@ def args_parser():
         "-lr",
         "--learning_rate",
         type=float,
-        default=0.01,
+        default=0.001,
         help="learning rate (default: 0.1)",
     )
     parser.add_argument(
@@ -165,7 +165,7 @@ def args_parser():
         "-op",
         "--optimizer",
         type=str,
-        default="sgd",
+        default="adam",
         choices=["sgd", "adam", "amsgrad"],
         help="optimizer used in the training process",
     )

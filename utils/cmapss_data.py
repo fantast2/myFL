@@ -306,6 +306,10 @@ def build_cmapss_client_data(
         engine_idx = list(test_engines.keys()).index(uid)
         X, y = _sliding_windows(eng_data, window_size, stride, pred_horizon,
                                 has_labels=False, base_rul=float(test_rul[engine_idx]))
+        # Cap labels at rul_cap: model trained with capped targets cannot predict
+        # above the cap, so evaluating on uncapped labels is invalid.
+        if rul_cap and rul_cap > 0:
+            y = np.minimum(y, float(rul_cap))
         y = y / _target_scale
         test_windows[uid] = (X, y)
 
@@ -444,13 +448,38 @@ def build_cmapss_client_data(
             f"{len(client_engines[cid])} engines"
         )
 
-    # --- 6. Global test loader (all test engines for server eval) ---
-    all_test_X = np.concatenate([test_windows[uid][0] for uid in test_engine_ids], axis=0)
-    all_test_y = np.concatenate([test_windows[uid][1] for uid in test_engine_ids], axis=0)
-    global_test_ds = CmapssDataset(all_test_X, all_test_y)
-    global_test_dl = data.DataLoader(global_test_ds, batch_size=batch_size, shuffle=False, drop_last=False)
+    # --- 6. Global test loader (CMAPSS standard: ONE prediction per engine) ---
+    # Standard CMAPSS evaluation: predict RUL from the LAST recorded cycle of
+    # each test engine, then compute RMSE across engines. This matches the
+    # benchmark protocol (one prediction per trajectory, not per sliding window).
+    global_test_X_list = []
+    global_test_y_list = []
+    for uid in test_engine_ids:
+        eng_data = test_engines[uid]
+        engine_idx = test_engine_ids.index(uid)
+        # Take only the last window_size cycles as input features
+        if len(eng_data) >= window_size:
+            last_win = eng_data[-window_size:]
+        else:
+            pad = window_size - len(eng_data)
+            last_win = np.concatenate(
+                [np.repeat(eng_data[:1], pad, axis=0), eng_data], axis=0)
+        global_test_X_list.append(last_win)
+        # Target: true RUL at the last recorded cycle, capped consistently with training
+        true_rul = float(test_rul[engine_idx])
+        if rul_cap and rul_cap > 0:
+            true_rul = min(true_rul, float(rul_cap))
+        global_test_y_list.append(true_rul / _target_scale)
 
-    logger.info(f"Global test: {len(global_test_ds)} samples from {len(test_engine_ids)} engines")
+    global_test_X = normalizer.transform(np.stack(global_test_X_list, axis=0))
+    global_test_y = np.array(global_test_y_list, dtype=np.float32)
+    global_test_ds = CmapssDataset(global_test_X, global_test_y)
+    global_test_dl = data.DataLoader(
+        global_test_ds, batch_size=batch_size, shuffle=False, drop_last=False)
+
+    logger.info(
+        f"Global test (CMAPSS standard): {len(global_test_ds)} engines, "
+        f"one prediction per engine")
     logger.info(f"Target scale factor (rul_cap): {_target_scale:.1f}")
 
     # Store scale factor so callers can unscale predictions/metrics
