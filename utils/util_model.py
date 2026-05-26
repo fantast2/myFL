@@ -5,7 +5,7 @@ import copy
 import torch
 import numpy as np
 
-from utils.models import ResNet18, MNISTCNN, FashionMNISTCNN, CmapssTransformer
+from utils.models import ResNet18, MNISTCNN, FashionMNISTCNN, CmapssLSTM
 
 # CMAPSS model input dimensions are set at init time based on the actual data.
 # They're stored here so get_client_model / get_server_model can read them.
@@ -41,7 +41,7 @@ def get_client_model(dataset: str, num_parties: int, device: torch.device) -> di
         elif dataset == "cifar10" or dataset == "svhn":
             model = ResNet18()
         elif dataset == "cmapss":
-            model = CmapssTransformer(
+            model = CmapssLSTM(
                 num_features=_cmapss_num_features or 12,
             )
         else:
@@ -71,7 +71,7 @@ def get_server_model(dataset: str, device: torch.device) -> torch.nn.Module:
     elif dataset == "cifar10" or dataset == "svhn":
         model = ResNet18()
     elif dataset == "cmapss":
-        model = CmapssTransformer(
+        model = CmapssLSTM(
             num_features=_cmapss_num_features or 12,
         )
     else:
